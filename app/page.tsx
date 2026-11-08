@@ -1,13 +1,13 @@
 "use client";
 
-import { useEffect, useRef, useState, type RefObject } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type RefObject } from "react";
 import Image from "next/image";
 import Link from "next/link";
 import { AnimatePresence, MotionConfig, motion } from "framer-motion";
 import {
   AlertCircle,
+  ArrowUpRight,
   BookOpen,
-  BookmarkCheck,
   BookmarkPlus,
   Building2,
   CalendarDays,
@@ -22,8 +22,17 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import Header from "@/app/components/Header";
-import FavoriteButton from "@/app/components/FavoriteButton";
+import ShelfSelector from "@/app/components/ShelfSelector";
 import { createClient } from "@/lib/supabase/client";
+import { cleanCoverUrl, formatDate, toPlainText } from "@/lib/books";
+import {
+  AuthRequiredError,
+  saveEntry,
+  uniqueShelves,
+  type BookRef,
+  type GrimoireEntry,
+  type ShelfState,
+} from "@/lib/grimoire";
 
 /* -------------------------------------------------------------------------- */
 /*                                    Types                                   */
@@ -77,6 +86,9 @@ const API_URL = "https://www.googleapis.com/books/v1/volumes";
 const FIELDS =
   "items(id,volumeInfo(title,subtitle,authors,publisher,publishedDate,description,pageCount,categories,averageRating,ratingsCount,language,imageLinks,infoLink,previewLink))";
 const DEFAULT_QUERY = "subject:fiction";
+const PAGE_SIZE = 20;
+/** Hard stop for infinite scroll, to be kind to the API quota. */
+const MAX_START_INDEX = 200;
 
 const SUGGESTIONS = [
   "Cozy mystery in a rainy seaside town",
@@ -100,10 +112,7 @@ function normalize(volume: Volume): Book | null {
   const info = volume.volumeInfo;
   if (!info?.title) return null;
 
-  const rawCover = info.imageLinks?.thumbnail ?? info.imageLinks?.smallThumbnail;
-  const cover = rawCover
-    ? rawCover.replace("http://", "https://").replace("&edge=curl", "")
-    : null;
+  const cover = cleanCoverUrl(info.imageLinks?.thumbnail ?? info.imageLinks?.smallThumbnail);
 
   return {
     id: volume.id,
@@ -122,90 +131,138 @@ function normalize(volume: Volume): Book | null {
   };
 }
 
-function toPlainText(html: string): string {
-  return html
-    .replace(/<br\s*\/?>/gi, "\n")
-    .replace(/<\/p>/gi, "\n\n")
-    .replace(/<[^>]+>/g, "")
-    .replace(/&nbsp;/g, " ")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&amp;/g, "&")
-    .trim();
+function toBookRef(book: Book): BookRef {
+  return {
+    id: book.id,
+    title: book.title,
+    author: book.authors.join(", ") || null,
+    cover: book.cover,
+  };
 }
 
-function formatDate(date?: string): string {
-  if (!date) return "Not recorded";
-  if (/^\d{4}-\d{2}-\d{2}$/.test(date)) {
-    return new Date(`${date}T00:00:00`).toLocaleDateString("en-US", {
-      year: "numeric",
-      month: "long",
-      day: "numeric",
-    });
+function takeUnseen(list: Book[], seen: Set<string>): Book[] {
+  const fresh: Book[] = [];
+  for (const book of list) {
+    if (seen.has(book.id)) continue;
+    seen.add(book.id);
+    fresh.push(book);
   }
-  if (/^\d{4}-\d{2}$/.test(date)) {
-    return new Date(`${date}-01T00:00:00`).toLocaleDateString("en-US", {
-      year: "numeric",
-      month: "long",
-    });
-  }
-  return date;
+  return fresh;
+}
+
+async function fetchPage(
+  query: string,
+  startIndex: number,
+  signal?: AbortSignal
+): Promise<{ books: Book[]; rawCount: number }> {
+  const apiKey = process.env.NEXT_PUBLIC_GOOGLE_BOOKS_API_KEY;
+  const url = `${API_URL}?q=${encodeURIComponent(query)}&startIndex=${startIndex}&maxResults=${PAGE_SIZE}&printType=books&fields=${encodeURIComponent(FIELDS)}${apiKey ? `&key=${encodeURIComponent(apiKey)}` : ""}`;
+
+  const res = await fetch(url, { signal });
+  if (!res.ok) throw new Error(`Google Books responded with ${res.status}`);
+
+  const data: { items?: Volume[] } = await res.json();
+  const items = data.items ?? [];
+  return {
+    books: items.map(normalize).filter((b): b is Book => b !== null),
+    rawCount: items.length,
+  };
 }
 
 /* -------------------------------------------------------------------------- */
-/*                          Data fetching (client-side)                       */
+/*                   Data fetching (client-side, paginated)                   */
 /* -------------------------------------------------------------------------- */
+
+interface Session {
+  gen: number;
+  query: string;
+  nextIndex: number;
+  seen: Set<string>;
+  busy: boolean;
+  hasMore: boolean;
+  controller: AbortController | null;
+}
 
 function useBookSearch(query: string) {
   const [books, setBooks] = useState<Book[]>([]);
-  const [savedBookIds, setSavedBookIds] = useState<Set<string>>(new Set());
+  const [entries, setEntries] = useState<Record<string, ShelfState>>({});
   const [status, setStatus] = useState<Status>("loading");
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [loadMoreError, setLoadMoreError] = useState(false);
+  const [hasMore, setHasMore] = useState(false);
   const [nonce, setNonce] = useState(0);
 
+  // Pagination bookkeeping lives in a ref so async callbacks never read stale
+  // state. `gen` identifies the current query: responses from older queries
+  // are ignored.
+  const session = useRef<Session>({
+    gen: 0,
+    query: "",
+    nextIndex: 0,
+    seen: new Set(),
+    busy: false,
+    hasMore: false,
+    controller: null,
+  });
+
+  // First page (and full reset) whenever the query changes or on retry.
   useEffect(() => {
+    const s = session.current;
+    s.controller?.abort();
     const controller = new AbortController();
+    const gen = s.gen + 1;
+    Object.assign(s, {
+      gen,
+      query,
+      nextIndex: 0,
+      seen: new Set<string>(),
+      busy: false,
+      hasMore: false,
+      controller,
+    });
+
+    setBooks([]);
+    setHasMore(false);
+    setLoadingMore(false);
+    setLoadMoreError(false);
     setStatus("loading");
 
     const timer = setTimeout(async () => {
       try {
         const supabase = createClient();
-        const apiKey = process.env.NEXT_PUBLIC_GOOGLE_BOOKS_API_KEY;
-        const url = `${API_URL}?q=${encodeURIComponent(query)}&maxResults=20&printType=books&fields=${encodeURIComponent(FIELDS)}${apiKey ? `&key=${encodeURIComponent(apiKey)}` : ""}`;
-
-        const [res, authRes] = await Promise.all([
-          fetch(url, { signal: controller.signal }),
+        const [page, authRes] = await Promise.all([
+          fetchPage(query, 0, controller.signal),
           supabase.auth.getUser(),
         ]);
+        if (gen !== s.gen) return;
 
-        if (!res.ok) throw new Error(`Google Books responded with ${res.status}`);
-
-        const data: { items?: Volume[] } = await res.json();
-        const seen = new Set<string>();
-        const next = (data.items ?? [])
-          .map(normalize)
-          .filter((book): book is Book => {
-            if (!book || seen.has(book.id)) return false;
-            seen.add(book.id);
-            return true;
-          });
-
+        const nextEntries: Record<string, ShelfState> = {};
         if (authRes.data.user) {
-          const { data: favorites } = await supabase
-            .from("favorites")
-            .select("book_id")
+          const { data } = await supabase
+            .from("grimoire_entries")
+            .select("book_id, status, custom_shelf, has_notes")
             .eq("user_id", authRes.data.user.id);
 
-          setSavedBookIds(new Set((favorites ?? []).map((f) => f.book_id)));
-        } else {
-          setSavedBookIds(new Set());
+          for (const row of (data ?? []) as unknown as Array<ShelfState & { book_id: string }>) {
+            nextEntries[row.book_id] = {
+              status: row.status,
+              custom_shelf: row.custom_shelf,
+              has_notes: row.has_notes,
+            };
+          }
+          if (gen !== s.gen) return;
         }
 
-        setBooks(next);
+        const fresh = takeUnseen(page.books, s.seen);
+        s.nextIndex = PAGE_SIZE;
+        s.hasMore = page.rawCount === PAGE_SIZE && s.nextIndex < MAX_START_INDEX;
+
+        setEntries(nextEntries);
+        setBooks(fresh);
+        setHasMore(s.hasMore);
         setStatus("success");
       } catch (err) {
-        if ((err as Error).name === "AbortError") return;
+        if ((err as Error).name === "AbortError" || gen !== s.gen) return;
         setBooks([]);
         setStatus("error");
       }
@@ -217,7 +274,47 @@ function useBookSearch(query: string) {
     };
   }, [query, nonce]);
 
-  return { books, savedBookIds, setSavedBookIds, status, retry: () => setNonce((n) => n + 1) };
+  const loadMore = useCallback(async () => {
+    const s = session.current;
+    if (s.busy || !s.hasMore) return;
+
+    s.busy = true;
+    const gen = s.gen;
+    setLoadingMore(true);
+    setLoadMoreError(false);
+
+    try {
+      const page = await fetchPage(s.query, s.nextIndex, s.controller?.signal);
+      if (gen !== s.gen) return;
+
+      const fresh = takeUnseen(page.books, s.seen);
+      s.nextIndex += PAGE_SIZE;
+      s.hasMore = page.rawCount === PAGE_SIZE && s.nextIndex < MAX_START_INDEX;
+
+      setBooks((prev) => [...prev, ...fresh]);
+      setHasMore(s.hasMore);
+    } catch (err) {
+      if ((err as Error).name === "AbortError" || gen !== s.gen) return;
+      setLoadMoreError(true);
+    } finally {
+      if (gen === s.gen) {
+        s.busy = false;
+        setLoadingMore(false);
+      }
+    }
+  }, []);
+
+  return {
+    books,
+    entries,
+    setEntries,
+    status,
+    hasMore,
+    loadingMore,
+    loadMoreError,
+    loadMore,
+    retry: () => setNonce((n) => n + 1),
+  };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -321,13 +418,73 @@ function SkeletonGrid() {
   );
 }
 
+interface LoadMoreSentinelProps {
+  hasMore: boolean;
+  loading: boolean;
+  error: boolean;
+  count: number;
+  onLoadMore: () => void;
+}
+
+/**
+ * Watches the bottom of the grid. The observer is recreated after every load,
+ * which re-fires it if the sentinel is still on screen, so tall viewports keep
+ * filling. The button is the fallback (and the retry after an error).
+ */
+function LoadMoreSentinel({ hasMore, loading, error, count, onLoadMore }: LoadMoreSentinelProps) {
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const el = ref.current;
+    if (!el || !hasMore || loading || error) return;
+    if (typeof IntersectionObserver === "undefined") return;
+
+    const observer = new IntersectionObserver(
+      (records) => {
+        if (records.some((r) => r.isIntersecting)) onLoadMore();
+      },
+      { rootMargin: "600px 0px" }
+    );
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [hasMore, loading, error, count, onLoadMore]);
+
+  if (!hasMore) {
+    return count > 0 ? (
+      <p className="mt-10 text-center font-serif text-sm text-[#D4C5B9]/70">
+        You&apos;ve reached the last shelf.
+      </p>
+    ) : null;
+  }
+
+  return (
+    <div ref={ref} className="mt-10 flex flex-col items-center gap-3">
+      {error && (
+        <p role="alert" className="text-sm text-red-300">
+          The next shelf didn&apos;t answer.
+        </p>
+      )}
+      <button
+        type="button"
+        onClick={onLoadMore}
+        disabled={loading}
+        className="inline-flex items-center gap-2 rounded-lg border border-amber-900/40 bg-[#1C130D]/70 px-5 py-2.5 text-sm font-semibold text-[#FDFBF7] backdrop-blur-md transition-colors hover:border-amber-500/60 hover:bg-amber-500/10 disabled:cursor-wait disabled:opacity-80"
+      >
+        {loading && <Loader2 className="h-4 w-4 animate-spin text-amber-400" aria-hidden />}
+        {loading ? "Summoning more tomes..." : error ? "Try again" : "Load more tomes"}
+      </button>
+    </div>
+  );
+}
+
 interface BookCardProps {
   book: Book;
   index: number;
   selected: boolean;
-  isFavorited: boolean;
+  entry: ShelfState | null;
+  shelves: string[];
   onSelect: (book: Book) => void;
-  onFavoriteToggle: (bookId: string, isSaved: boolean) => void;
+  onEntryChange: (bookId: string, entry: GrimoireEntry | null) => void;
 }
 
 // Placeholder vibe tags. Swap for real data once you have it.
@@ -338,7 +495,15 @@ const VIBE_PLACEHOLDERS: [string, string][] = [
   ["#dark-academia", "#haunting"],
 ];
 
-function BookCard({ book, index, selected, isFavorited, onSelect, onFavoriteToggle }: BookCardProps) {
+function BookCard({
+  book,
+  index,
+  selected,
+  entry,
+  shelves,
+  onSelect,
+  onEntryChange,
+}: BookCardProps) {
   const featured = index % 9 === 0;
   const authors = book.authors.join(", ") || "Author unknown";
   const vibeTags = VIBE_PLACEHOLDERS[index % VIBE_PLACEHOLDERS.length];
@@ -357,7 +522,8 @@ function BookCard({ book, index, selected, isFavorited, onSelect, onFavoriteTogg
       aria-pressed={selected}
       initial={{ opacity: 0, y: 8 }}
       animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.25, delay: Math.min(index * 0.02, 0.3) }}
+      // Stagger within each page of results, not across the whole list.
+      transition={{ duration: 0.25, delay: Math.min((index % PAGE_SIZE) * 0.02, 0.3) }}
       whileHover={{ y: -4, transition: { duration: 0.3, delay: 0 } }}
       whileTap={{ scale: 0.99 }}
       className={`${GLASS} group relative overflow-hidden rounded-2xl text-left cursor-pointer transition-[border-color,box-shadow] duration-300 ${
@@ -366,17 +532,23 @@ function BookCard({ book, index, selected, isFavorited, onSelect, onFavoriteTogg
           : "hover:border-amber-600/60 hover:shadow-[0_0_15px_rgba(218,165,32,0.3)]"
       } ${spanClass(index)}`}
     >
+      <Link
+        href={`/book/${encodeURIComponent(book.id)}`}
+        onClick={(e) => e.stopPropagation()}
+        onKeyDown={(e) => e.stopPropagation()}
+        aria-label={`Open the full page for ${book.title}`}
+        className="absolute left-2.5 top-2.5 z-20 grid h-9 w-9 place-items-center rounded-full bg-black/55 text-[#FDFBF7] ring-1 ring-amber-500/30 backdrop-blur transition-colors hover:bg-black/75 hover:ring-amber-500/60"
+      >
+        <ArrowUpRight className="h-4 w-4" aria-hidden />
+      </Link>
+
       <div className="absolute right-2.5 top-2.5 z-20">
-        <FavoriteButton
-          key={`${book.id}-${isFavorited}`}
-          book={{
-            id: book.id,
-            title: book.title,
-            author: authors,
-            cover: book.cover,
-          }}
-          initialIsFavorited={isFavorited}
-          onToggle={(isSaved) => onFavoriteToggle(book.id, isSaved)}
+        <ShelfSelector
+          variant="compact"
+          book={toBookRef(book)}
+          entry={entry}
+          shelves={shelves}
+          onChange={(next) => onEntryChange(book.id, next)}
         />
       </div>
 
@@ -452,14 +624,16 @@ function MetaRow({
 
 function DetailPanel({
   book,
-  isFavorited,
+  entry,
+  shelves,
   onClose,
-  onFavoriteToggle,
+  onEntryChange,
 }: {
   book: Book | null;
-  isFavorited: boolean;
+  entry: ShelfState | null;
+  shelves: string[];
   onClose: () => void;
-  onFavoriteToggle: (bookId: string, isSaved: boolean) => void;
+  onEntryChange: (bookId: string, entry: GrimoireEntry | null) => void;
 }) {
   const authors = book?.authors.join(", ") || "Author unknown";
   const [binding, setBinding] = useState(false);
@@ -475,37 +649,10 @@ function DetailPanel({
     setBindError(null);
 
     try {
-      const supabase = createClient();
-      const {
-        data: { user },
-      } = await supabase.auth.getUser();
-
-      if (!user) {
-        setBindError("login");
-        return;
-      }
-
-      if (isFavorited) {
-        const { error } = await supabase
-          .from("favorites")
-          .delete()
-          .eq("user_id", user.id)
-          .eq("book_id", book.id);
-        if (error) throw error;
-        onFavoriteToggle(book.id, false);
-      } else {
-        const { error } = await supabase.from("favorites").insert({
-          user_id: user.id,
-          book_id: book.id,
-          book_title: book.title,
-          book_author: authors,
-          book_cover: book.cover,
-        });
-        if (error) throw error;
-        onFavoriteToggle(book.id, true);
-      }
-    } catch {
-      setBindError("failed");
+      const saved = await saveEntry(createClient(), toBookRef(book));
+      onEntryChange(book.id, saved);
+    } catch (err) {
+      setBindError(err instanceof AuthRequiredError ? "login" : "failed");
     } finally {
       setBinding(false);
     }
@@ -537,27 +684,14 @@ function DetailPanel({
           >
             <div className="flex items-center justify-between border-b border-amber-900/30 px-6 py-3">
               <span className="font-serif text-sm text-[#D4C5B9]">From the archive</span>
-              <div className="flex items-center gap-2">
-                <FavoriteButton
-                  key={`${book.id}-${isFavorited}`}
-                  book={{
-                    id: book.id,
-                    title: book.title,
-                    author: authors,
-                    cover: book.cover,
-                  }}
-                  initialIsFavorited={isFavorited}
-                  onToggle={(isSaved) => onFavoriteToggle(book.id, isSaved)}
-                />
-                <button
-                  type="button"
-                  onClick={onClose}
-                  aria-label="Close book details"
-                  className="rounded-md p-1.5 text-[#D4C5B9]/80 transition-colors hover:bg-amber-500/10 hover:text-[#FDFBF7]"
-                >
-                  <X className="h-4 w-4" />
-                </button>
-              </div>
+              <button
+                type="button"
+                onClick={onClose}
+                aria-label="Close book details"
+                className="rounded-md p-1.5 text-[#D4C5B9]/80 transition-colors hover:bg-amber-500/10 hover:text-[#FDFBF7]"
+              >
+                <X className="h-4 w-4" />
+              </button>
             </div>
 
             <motion.div
@@ -597,6 +731,18 @@ function DetailPanel({
                   books.google.com
                   <ExternalLink className="h-3 w-3" aria-hidden />
                 </a>
+              )}
+
+              {entry && (
+                <div className="mt-5">
+                  <ShelfSelector
+                    variant="full"
+                    book={toBookRef(book)}
+                    entry={entry}
+                    shelves={shelves}
+                    onChange={(next) => onEntryChange(book.id, next)}
+                  />
+                </div>
               )}
 
               <div className="mt-6">
@@ -644,29 +790,21 @@ function DetailPanel({
             </motion.div>
 
             <div className="space-y-2.5 border-t border-amber-900/30 p-4">
-              <button
-                type="button"
-                onClick={handleBind}
-                disabled={binding}
-                className={`flex w-full items-center justify-center gap-2 rounded-lg px-4 py-3 text-sm font-semibold transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-500 disabled:cursor-not-allowed disabled:opacity-70 ${
-                  isFavorited
-                    ? "border border-amber-500/60 bg-amber-500/10 text-amber-300 hover:bg-amber-500/20"
-                    : "bg-gradient-to-r from-amber-600 to-amber-700 text-white shadow-[0_0_20px_-6px_rgba(245,158,11,0.6)] hover:from-amber-500 hover:to-amber-600"
-                }`}
-              >
-                {binding ? (
-                  <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
-                ) : isFavorited ? (
-                  <BookmarkCheck className="h-4 w-4" aria-hidden />
-                ) : (
-                  <BookmarkPlus className="h-4 w-4" aria-hidden />
-                )}
-                {binding
-                  ? "Binding..."
-                  : isFavorited
-                    ? "Bound to your Grimoire"
-                    : "Bind to Grimoire"}
-              </button>
+              {!entry && (
+                <button
+                  type="button"
+                  onClick={handleBind}
+                  disabled={binding}
+                  className="flex w-full items-center justify-center gap-2 rounded-lg bg-gradient-to-r from-amber-600 to-amber-700 px-4 py-3 text-sm font-semibold text-white shadow-[0_0_20px_-6px_rgba(245,158,11,0.6)] transition-colors hover:from-amber-500 hover:to-amber-600 focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-500 disabled:cursor-not-allowed disabled:opacity-70"
+                >
+                  {binding ? (
+                    <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
+                  ) : (
+                    <BookmarkPlus className="h-4 w-4" aria-hidden />
+                  )}
+                  {binding ? "Binding..." : "Bind to Grimoire"}
+                </button>
+              )}
 
               {bindError && (
                 <p role="alert" className="text-center text-xs text-red-300">
@@ -685,6 +823,14 @@ function DetailPanel({
                   )}
                 </p>
               )}
+
+              <Link
+                href={`/book/${encodeURIComponent(book.id)}`}
+                className="flex w-full items-center justify-center gap-2 rounded-lg border border-amber-500/40 bg-amber-500/5 px-4 py-2.5 text-sm font-semibold text-amber-300 transition-colors hover:bg-amber-500/15"
+              >
+                Open the full tome page
+                <ArrowUpRight className="h-4 w-4" aria-hidden />
+              </Link>
 
               {book.link && (
                 <a
@@ -754,21 +900,40 @@ export default function DiscoverPage() {
   const inputRef = useRef<HTMLInputElement>(null);
 
   const trimmed = input.trim();
-  const { books, savedBookIds, setSavedBookIds, status, retry } = useBookSearch(
-    trimmed || DEFAULT_QUERY
-  );
+  const {
+    books,
+    entries,
+    setEntries,
+    status,
+    hasMore,
+    loadingMore,
+    loadMoreError,
+    loadMore,
+    retry,
+  } = useBookSearch(trimmed || DEFAULT_QUERY);
 
-  const handleFavoriteToggle = (bookId: string, isSaved: boolean) => {
-    setSavedBookIds((prev) => {
-      const next = new Set(prev);
-      if (isSaved) {
-        next.add(bookId);
-      } else {
-        next.delete(bookId);
-      }
-      return next;
-    });
-  };
+  const shelves = useMemo(() => uniqueShelves(Object.values(entries)), [entries]);
+
+  const handleEntryChange = useCallback(
+    (bookId: string, next: GrimoireEntry | null) => {
+      setEntries((prev) => {
+        if (next === null) {
+          const copy = { ...prev };
+          delete copy[bookId];
+          return copy;
+        }
+        return {
+          ...prev,
+          [bookId]: {
+            status: next.status,
+            custom_shelf: next.custom_shelf,
+            has_notes: next.has_notes,
+          },
+        };
+      });
+    },
+    [setEntries]
+  );
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -837,7 +1002,10 @@ export default function DiscoverPage() {
                   {resultsLabel}
                 </h2>
                 {status === "success" && books.length > 0 && (
-                  <span className="text-xs text-[#D4C5B9]/70">{books.length} tomes</span>
+                  <span className="text-xs text-[#D4C5B9]/70">
+                    {books.length}
+                    {hasMore ? "+" : ""} tomes
+                  </span>
                 )}
               </div>
 
@@ -845,19 +1013,30 @@ export default function DiscoverPage() {
               {status === "error" && <ErrorState onRetry={retry} />}
               {status === "success" && books.length === 0 && <EmptyState />}
               {status === "success" && books.length > 0 && (
-                <div className={GRID_CLASSES}>
-                  {books.map((book, index) => (
-                    <BookCard
-                      key={book.id}
-                      book={book}
-                      index={index}
-                      selected={selected?.id === book.id}
-                      isFavorited={savedBookIds.has(book.id)}
-                      onSelect={setSelected}
-                      onFavoriteToggle={handleFavoriteToggle}
-                    />
-                  ))}
-                </div>
+                <>
+                  <div className={GRID_CLASSES}>
+                    {books.map((book, index) => (
+                      <BookCard
+                        key={book.id}
+                        book={book}
+                        index={index}
+                        selected={selected?.id === book.id}
+                        entry={entries[book.id] ?? null}
+                        shelves={shelves}
+                        onSelect={setSelected}
+                        onEntryChange={handleEntryChange}
+                      />
+                    ))}
+                  </div>
+
+                  <LoadMoreSentinel
+                    hasMore={hasMore}
+                    loading={loadingMore}
+                    error={loadMoreError}
+                    count={books.length}
+                    onLoadMore={loadMore}
+                  />
+                </>
               )}
             </section>
           </main>
@@ -865,9 +1044,10 @@ export default function DiscoverPage() {
 
         <DetailPanel
           book={selected}
-          isFavorited={selected ? savedBookIds.has(selected.id) : false}
+          entry={selected ? entries[selected.id] ?? null : null}
+          shelves={shelves}
           onClose={() => setSelected(null)}
-          onFavoriteToggle={handleFavoriteToggle}
+          onEntryChange={handleEntryChange}
         />
       </div>
     </MotionConfig>

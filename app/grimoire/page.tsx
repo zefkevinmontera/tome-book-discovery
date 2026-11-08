@@ -1,26 +1,111 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import Image from "next/image";
 import Link from "next/link";
-import { Loader2 } from "lucide-react";
+import { motion } from "framer-motion";
+import { Loader2, NotebookPen, ScrollText, Tag } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
-import FavoriteButton from "@/app/components/FavoriteButton";
+import {
+  LIST_COLUMNS,
+  STATUS_OPTIONS,
+  STATUS_SHORT,
+  sameShelf,
+  uniqueShelves,
+  type BookRef,
+  type GrimoireEntry,
+  type GrimoireListEntry,
+  type ReadingStatus,
+} from "@/lib/grimoire";
 import Header from "@/app/components/Header";
+import TiltBookCard from "@/app/components/TiltBookCard";
+import Manifest from "@/app/components/Manifest";
+import ShelfSelector, { STATUS_ICON } from "@/app/components/ShelfSelector";
+import { BookJournalDrawer } from "@/app/components/BookJournalNote";
 
-type FavoriteRow = {
-  id: string;
-  book_id: string;
-  book_title: string;
-  book_author: string | null;
-  book_cover: string | null;
-  created_at: string;
-};
+type StatusFilter = "all" | ReadingStatus;
+
+const TABS: ReadonlyArray<{ value: StatusFilter; label: string }> = [
+  { value: "all", label: "All" },
+  ...STATUS_OPTIONS.map(({ value, label }) => ({ value, label })),
+];
+
+function toRef(entry: GrimoireListEntry): BookRef {
+  return {
+    id: entry.book_id,
+    title: entry.book_title,
+    author: entry.book_author,
+    cover: entry.book_cover,
+  };
+}
+
+/* -------------------------------------------------------------------------- */
+/*                               Small card pieces                            */
+/* -------------------------------------------------------------------------- */
+
+function CardMeta({
+  entry,
+  onOpenJournal,
+}: {
+  entry: GrimoireListEntry;
+  onOpenJournal: () => void;
+}) {
+  const Icon = STATUS_ICON[entry.status];
+  return (
+    <div className="space-y-2">
+      <div className="flex flex-wrap items-center gap-1.5">
+        <span className="inline-flex items-center gap-1 rounded-full border border-amber-700/30 px-2 py-0.5 text-xs text-amber-200/80">
+          <Icon className="h-3 w-3" aria-hidden />
+          {STATUS_SHORT[entry.status]}
+        </span>
+        {entry.custom_shelf && (
+          <span className="inline-flex max-w-full items-center gap-1 rounded-full border border-amber-900/40 bg-black/20 px-2 py-0.5 text-xs text-[#D4C5B9]">
+            <Tag className="h-3 w-3 shrink-0" aria-hidden />
+            <span className="truncate">{entry.custom_shelf}</span>
+          </span>
+        )}
+      </div>
+      <button
+        type="button"
+        onClick={onOpenJournal}
+        className="inline-flex items-center gap-1.5 text-xs text-[#D4C5B9]/80 transition-colors hover:text-amber-300"
+      >
+        <NotebookPen className="h-3.5 w-3.5" aria-hidden />
+        {entry.has_notes ? "Read journal" : "Add a note"}
+      </button>
+    </div>
+  );
+}
+
+function NotesIndicator({ title, onClick }: { title: string; onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-label={`Open your journal notes for ${title}`}
+      title="You have notes on this tome"
+      className="grid h-8 w-8 place-items-center rounded-full bg-black/55 text-amber-300 shadow-[0_0_14px_rgba(245,158,11,0.35)] ring-1 ring-amber-500/40 backdrop-blur transition-colors hover:bg-black/75 hover:ring-amber-500/70"
+    >
+      <ScrollText className="h-4 w-4" aria-hidden />
+    </button>
+  );
+}
+
+/* -------------------------------------------------------------------------- */
+/*                                    Page                                    */
+/* -------------------------------------------------------------------------- */
 
 export default function GrimoirePage() {
-  const [favorites, setFavorites] = useState<FavoriteRow[]>([]);
+  const [entries, setEntries] = useState<GrimoireListEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [userLoggedIn, setUserLoggedIn] = useState(false);
+
+  const [activeStatus, setActiveStatus] = useState<StatusFilter>("all");
+  const [activeShelf, setActiveShelf] = useState<string | null>(null);
+  // Cards the reader just re-shelved stay visible until the filter changes, so
+  // the shelf dialog doesn't vanish from under the cursor mid-interaction.
+  const [lingering, setLingering] = useState<Set<string>>(new Set());
+  const [journalBook, setJournalBook] = useState<BookRef | null>(null);
 
   useEffect(() => {
     async function loadGrimoire() {
@@ -38,13 +123,13 @@ export default function GrimoirePage() {
       setUserLoggedIn(true);
 
       const { data, error } = await supabase
-        .from("favorites")
-        .select("id, book_id, book_title, book_author, book_cover, created_at")
+        .from("grimoire_entries")
+        .select(LIST_COLUMNS)
         .eq("user_id", user.id)
         .order("created_at", { ascending: false });
 
       if (!error && data) {
-        setFavorites(data as FavoriteRow[]);
+        setEntries(data as unknown as GrimoireListEntry[]);
       }
       setLoading(false);
     }
@@ -52,9 +137,76 @@ export default function GrimoirePage() {
     loadGrimoire();
   }, []);
 
-  const handleRemoveFavorite = (bookId: string) => {
-    setFavorites((prev) => prev.filter((item) => item.book_id !== bookId));
-  };
+  const handleEntryChange = useCallback((bookId: string, next: GrimoireEntry | null) => {
+    if (next === null) {
+      setEntries((prev) => prev.filter((e) => e.book_id !== bookId));
+      return;
+    }
+    setLingering((prev) => new Set(prev).add(bookId));
+    setEntries((prev) =>
+      prev.map((e) =>
+        e.book_id === bookId
+          ? {
+              ...e,
+              status: next.status,
+              custom_shelf: next.custom_shelf,
+              has_notes: next.has_notes,
+              updated_at: next.updated_at,
+            }
+          : e
+      )
+    );
+  }, []);
+
+  const closeJournal = useCallback(() => setJournalBook(null), []);
+
+  function selectStatus(value: StatusFilter) {
+    setActiveStatus(value);
+    setLingering(new Set());
+  }
+
+  function selectShelf(name: string | null) {
+    setActiveShelf(name);
+    setLingering(new Set());
+  }
+
+  /* ----------------------------- Derived views ----------------------------- */
+
+  const shelfNames = useMemo(() => uniqueShelves(entries), [entries]);
+  const shelf = activeShelf && shelfNames.some((s) => sameShelf(s, activeShelf)) ? activeShelf : null;
+
+  const { tabCounts, shelfCounts, visible } = useMemo(() => {
+    const matchesShelf = (e: GrimoireListEntry) => shelf === null || sameShelf(e.custom_shelf, shelf);
+    const matchesStatus = (e: GrimoireListEntry) =>
+      activeStatus === "all" || e.status === activeStatus;
+
+    const tabCounts: Record<StatusFilter, number> = {
+      all: 0,
+      want_to_read: 0,
+      currently_reading: 0,
+      finished: 0,
+    };
+    const shelfCounts = new Map<string, number>();
+
+    for (const e of entries) {
+      if (matchesShelf(e)) {
+        tabCounts.all += 1;
+        tabCounts[e.status] += 1;
+      }
+      if (matchesStatus(e) && e.custom_shelf) {
+        const key = e.custom_shelf.toLowerCase();
+        shelfCounts.set(key, (shelfCounts.get(key) ?? 0) + 1);
+      }
+    }
+
+    const visible = entries.filter(
+      (e) => (matchesShelf(e) && matchesStatus(e)) || lingering.has(e.book_id)
+    );
+
+    return { tabCounts, shelfCounts, visible };
+  }, [entries, activeStatus, shelf, lingering]);
+
+  /* --------------------------------- Render -------------------------------- */
 
   return (
     <div className="relative min-h-screen text-[#D4C5B9]">
@@ -81,7 +233,10 @@ export default function GrimoirePage() {
         </main>
       ) : !userLoggedIn ? (
         <main className="flex min-h-[70vh] items-center justify-center px-4 py-16">
-          <div className="relative w-full max-w-md overflow-hidden rounded-2xl border border-amber-900/30 shadow-2xl shadow-black/40">
+          <div
+            data-glow
+            className="relative w-full max-w-md overflow-hidden rounded-2xl border border-amber-900/30 shadow-2xl shadow-black/40"
+          >
             <Image
               src="/hero-bg.jpg"
               alt=""
@@ -94,12 +249,16 @@ export default function GrimoirePage() {
 
             <div className="relative p-10 text-center">
               <div className="mb-5 text-5xl" aria-hidden="true">📜</div>
-              <h1 className="mb-3 font-serif text-3xl font-bold tracking-wide text-[#FDFBF7]">
+              <Manifest
+                as="h1"
+                by="word"
+                className="mb-3 font-serif text-3xl font-bold tracking-wide text-[#FDFBF7]"
+              >
                 Log in to unlock your Grimoire
-              </h1>
-              <p className="mb-8 text-[#D4C5B9]">
+              </Manifest>
+              <Manifest as="p" delay={0.5} className="mb-8 text-[#D4C5B9]">
                 Sign in to bind your favorite tomes into a personal collection.
-              </p>
+              </Manifest>
               <Link
                 href="/login"
                 className="inline-flex items-center justify-center rounded-lg bg-gradient-to-r from-amber-600 to-amber-500 px-8 py-3 font-semibold text-[#130D08] shadow-lg shadow-amber-900/30 transition hover:from-amber-500 hover:to-amber-400 focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-500"
@@ -109,9 +268,12 @@ export default function GrimoirePage() {
             </div>
           </div>
         </main>
-      ) : favorites.length === 0 ? (
+      ) : entries.length === 0 ? (
         <main className="flex min-h-[70vh] items-center justify-center px-4 py-16">
-          <div className="relative w-full max-w-lg overflow-hidden rounded-2xl border border-amber-900/30 shadow-2xl shadow-black/40">
+          <div
+            data-glow
+            className="relative w-full max-w-lg overflow-hidden rounded-2xl border border-amber-900/30 shadow-2xl shadow-black/40"
+          >
             <Image
               src="/hero-bg.jpg"
               alt=""
@@ -124,12 +286,16 @@ export default function GrimoirePage() {
 
             <div className="relative p-10 text-center">
               <div className="mb-5 text-5xl" aria-hidden="true">🕯️</div>
-              <h1 className="mb-3 font-serif text-3xl font-bold tracking-wide text-[#FDFBF7]">
+              <Manifest
+                as="h1"
+                by="word"
+                className="mb-3 font-serif text-3xl font-bold tracking-wide text-[#FDFBF7]"
+              >
                 Your shelves are currently bare...
-              </h1>
-              <p className="mb-8 text-[#D4C5B9]">
+              </Manifest>
+              <Manifest as="p" delay={0.6} className="mb-8 text-[#D4C5B9]">
                 Your Grimoire awaits its first tome. Wander the library, and bind the stories that call to you.
-              </p>
+              </Manifest>
               <Link
                 href="/"
                 className="inline-flex items-center justify-center rounded-lg bg-gradient-to-r from-amber-600 to-amber-500 px-8 py-3 font-semibold text-[#130D08] shadow-lg shadow-amber-900/30 transition hover:from-amber-500 hover:to-amber-400 focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-500"
@@ -141,70 +307,177 @@ export default function GrimoirePage() {
         </main>
       ) : (
         <main className="mx-auto max-w-7xl px-4 py-12 sm:px-6 lg:px-8">
-          <header className="mb-10 text-center md:text-left">
-            <h1 className="font-serif text-4xl font-bold tracking-wide text-[#FDFBF7]">
+          <header className="mb-8 text-center md:text-left">
+            <Manifest
+              as="h1"
+              by="word"
+              className="font-serif text-4xl font-bold tracking-wide text-[#FDFBF7]"
+            >
               My Grimoire
-            </h1>
-            <p className="mt-2 text-[#D4C5B9]">
-              {favorites.length} {favorites.length === 1 ? "tome" : "tomes"} bound to your collection
-            </p>
+            </Manifest>
+            <Manifest as="p" delay={0.35} className="mt-2 text-[#D4C5B9]">
+              {entries.length} {entries.length === 1 ? "tome" : "tomes"} bound to your collection
+            </Manifest>
           </header>
 
-          <ul className="grid grid-cols-2 gap-4 sm:gap-6 md:grid-cols-4 lg:grid-cols-5">
-            {favorites.map((item) => {
-              const book = {
-                id: item.book_id,
-                title: item.book_title,
-                author: item.book_author ?? "Unknown author",
-                cover: item.book_cover,
-              };
-
+          {/* Status tabs */}
+          <div
+            role="tablist"
+            aria-label="Filter by reading status"
+            className="flex gap-1 overflow-x-auto border-b border-amber-900/30"
+          >
+            {TABS.map((tab) => {
+              const active = activeStatus === tab.value;
               return (
-                <li
-                  key={item.id}
-                  className="group overflow-hidden rounded-xl border border-amber-900/30 bg-[#1C130D]/75 shadow-lg shadow-black/30 backdrop-blur-md transition duration-300 hover:-translate-y-1 hover:border-amber-600/50"
+                <button
+                  key={tab.value}
+                  type="button"
+                  role="tab"
+                  id={`grimoire-tab-${tab.value}`}
+                  aria-selected={active}
+                  aria-controls="grimoire-panel"
+                  onClick={() => selectStatus(tab.value)}
+                  className={`relative shrink-0 whitespace-nowrap px-4 py-2.5 text-sm font-medium transition-colors ${
+                    active ? "text-[#FDFBF7]" : "text-[#D4C5B9] hover:text-amber-400"
+                  }`}
                 >
-                  <div className="relative aspect-[2/3] w-full bg-[#130D08]">
-                    {book.cover ? (
-                      <Image
-                        src={book.cover}
-                        alt={`Cover of ${book.title}`}
-                        fill
-                        sizes="(min-width: 1024px) 20vw, (min-width: 768px) 25vw, 50vw"
-                        className="object-cover"
-                      />
-                    ) : (
-                      <div className="flex h-full w-full items-center justify-center p-4 text-center font-serif text-sm text-[#D4C5B9]/70">
-                        No cover
-                      </div>
-                    )}
-                    <div className="absolute right-2 top-2 z-10">
-                      <FavoriteButton
-                        book={book}
-                        initialIsFavorited={true}
-                        onToggle={(isFavorited) => {
-                          if (!isFavorited) {
-                            handleRemoveFavorite(book.id);
-                          }
-                        }}
-                      />
-                    </div>
-                  </div>
-
-                  <div className="p-3 sm:p-4">
-                    <h2 className="line-clamp-2 font-serif text-base font-semibold text-[#FDFBF7]" title={book.title}>
-                      {book.title}
-                    </h2>
-                    <p className="mt-1 line-clamp-1 text-sm text-[#D4C5B9]">
-                      {book.author}
-                    </p>
-                  </div>
-                </li>
+                  {tab.label}
+                  <span
+                    className={`ml-2 rounded-full px-1.5 py-0.5 text-xs tabular-nums ${
+                      active ? "bg-amber-500/20 text-amber-300" : "bg-amber-500/10 text-[#D4C5B9]/80"
+                    }`}
+                  >
+                    {tabCounts[tab.value]}
+                  </span>
+                  {active && (
+                    <motion.span
+                      layoutId="grimoire-tab-underline"
+                      className="absolute inset-x-2 -bottom-px h-0.5 rounded-full bg-gradient-to-r from-amber-600 to-amber-400"
+                    />
+                  )}
+                </button>
               );
             })}
-          </ul>
+          </div>
+
+          {/* Custom shelf pills */}
+          {shelfNames.length > 0 && (
+            <div
+              role="group"
+              aria-label="Filter by shelf"
+              className="mt-4 flex flex-wrap items-center gap-2"
+            >
+              <span className="text-xs text-[#D4C5B9]/70">Shelves:</span>
+              <button
+                type="button"
+                aria-pressed={shelf === null}
+                onClick={() => selectShelf(null)}
+                className={`rounded-full border px-3 py-1 text-xs transition-colors ${
+                  shelf === null
+                    ? "border-amber-500/70 bg-amber-500/15 text-amber-300"
+                    : "border-amber-900/40 bg-[#1C130D]/70 text-[#D4C5B9] hover:border-amber-500/60 hover:text-[#FDFBF7]"
+                }`}
+              >
+                All shelves
+              </button>
+              {shelfNames.map((name) => {
+                const active = sameShelf(shelf, name);
+                return (
+                  <button
+                    key={name}
+                    type="button"
+                    aria-pressed={active}
+                    onClick={() => selectShelf(active ? null : name)}
+                    className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs transition-colors ${
+                      active
+                        ? "border-amber-500/70 bg-amber-500/15 text-amber-300"
+                        : "border-amber-900/40 bg-[#1C130D]/70 text-[#D4C5B9] hover:border-amber-500/60 hover:text-[#FDFBF7]"
+                    }`}
+                  >
+                    <Tag className="h-3 w-3" aria-hidden />
+                    {name}
+                    <span className="tabular-nums text-[#D4C5B9]/70">
+                      {shelfCounts.get(name.toLowerCase()) ?? 0}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+
+          {/* Grid */}
+          <div
+            id="grimoire-panel"
+            role="tabpanel"
+            aria-labelledby={`grimoire-tab-${activeStatus}`}
+            className="mt-8"
+          >
+            {visible.length === 0 ? (
+              <div className="mx-auto max-w-md rounded-2xl border border-amber-900/30 bg-[#1C130D]/75 p-10 text-center backdrop-blur-md">
+                <h2 className="font-serif text-xl font-semibold text-[#FDFBF7]">
+                  Nothing rests here yet
+                </h2>
+                <p className="mt-2 text-sm">
+                  No tomes match this shelf and status. Try a different filter.
+                </p>
+                <button
+                  type="button"
+                  onClick={() => {
+                    selectStatus("all");
+                    selectShelf(null);
+                  }}
+                  className="mt-5 rounded-lg border border-amber-900/40 px-4 py-2 text-sm font-semibold text-[#FDFBF7] transition-colors hover:bg-amber-500/10"
+                >
+                  Show everything
+                </button>
+              </div>
+            ) : (
+              <ul className="grid grid-cols-2 gap-4 sm:gap-6 md:grid-cols-4 lg:grid-cols-5">
+                {visible.map((entry, index) => {
+                  const ref = toRef(entry);
+                  return (
+                    <TiltBookCard
+                      key={entry.id}
+                      book={{
+                        id: entry.book_id,
+                        title: entry.book_title,
+                        author: entry.book_author ?? "Unknown author",
+                        cover: entry.book_cover,
+                      }}
+                      index={index}
+                      href={`/book/${encodeURIComponent(entry.book_id)}`}
+                      topLeft={
+                        entry.has_notes ? (
+                          <NotesIndicator
+                            title={entry.book_title}
+                            onClick={() => setJournalBook(ref)}
+                          />
+                        ) : undefined
+                      }
+                      topRight={
+                        <ShelfSelector
+                          variant="compact"
+                          book={ref}
+                          entry={entry}
+                          shelves={shelfNames}
+                          onChange={(next) => handleEntryChange(entry.book_id, next)}
+                        />
+                      }
+                      footer={<CardMeta entry={entry} onOpenJournal={() => setJournalBook(ref)} />}
+                    />
+                  );
+                })}
+              </ul>
+            )}
+          </div>
         </main>
       )}
+
+      <BookJournalDrawer
+        book={journalBook}
+        onClose={closeJournal}
+        onSaved={(entry) => handleEntryChange(entry.book_id, entry)}
+      />
     </div>
   );
 }

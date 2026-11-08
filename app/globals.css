@@ -108,3 +108,31 @@ body {
     scroll-behavior: auto;
   }
 }
+
+/* ───────────── Cursor-reactive glow borders ─────────────
+ * Any positioned element with a `data-glow` attribute gets a 1px metallic
+ * amber border that is revealed near the cursor. The coordinates
+ * (--glow-x / --glow-y) are written by <CursorSpotlight />.
+ * Touch devices never match this media query, so nothing renders there.
+ */
+@media (hover: hover) and (pointer: fine) {
+  [data-glow]::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    padding: 1px;
+    pointer-events: none;
+    background: radial-gradient(
+      240px circle at var(--glow-x, -9999px) var(--glow-y, -9999px),
+      rgba(253, 230, 138, 0.85),
+      rgba(245, 158, 11, 0.5) 35%,
+      rgba(120, 53, 15, 0.15) 65%,
+      transparent 80%
+    );
+    -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+    -webkit-mask-composite: xor;
+    mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+    mask-composite: exclude;
+  }
+}
