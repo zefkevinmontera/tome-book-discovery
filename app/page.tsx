@@ -2,10 +2,13 @@
 
 import { useEffect, useRef, useState, type RefObject } from "react";
 import Image from "next/image";
+import Link from "next/link";
 import { AnimatePresence, MotionConfig, motion } from "framer-motion";
 import {
   AlertCircle,
   BookOpen,
+  BookmarkCheck,
+  BookmarkPlus,
   Building2,
   CalendarDays,
   ExternalLink,
@@ -327,9 +330,18 @@ interface BookCardProps {
   onFavoriteToggle: (bookId: string, isSaved: boolean) => void;
 }
 
+// Placeholder vibe tags. Swap for real data once you have it.
+const VIBE_PLACEHOLDERS: [string, string][] = [
+  ["#cozy", "#mystery"],
+  ["#atmospheric", "#slow-burn"],
+  ["#whimsical", "#found-family"],
+  ["#dark-academia", "#haunting"],
+];
+
 function BookCard({ book, index, selected, isFavorited, onSelect, onFavoriteToggle }: BookCardProps) {
   const featured = index % 9 === 0;
   const authors = book.authors.join(", ") || "Author unknown";
+  const vibeTags = VIBE_PLACEHOLDERS[index % VIBE_PLACEHOLDERS.length];
 
   return (
     <motion.div
@@ -346,16 +358,17 @@ function BookCard({ book, index, selected, isFavorited, onSelect, onFavoriteTogg
       initial={{ opacity: 0, y: 8 }}
       animate={{ opacity: 1, y: 0 }}
       transition={{ duration: 0.25, delay: Math.min(index * 0.02, 0.3) }}
-      whileHover={{ y: -2 }}
+      whileHover={{ y: -4, transition: { duration: 0.3, delay: 0 } }}
       whileTap={{ scale: 0.99 }}
-      className={`${GLASS} group relative overflow-hidden rounded-2xl text-left cursor-pointer transition-[border-color,box-shadow] ${
+      className={`${GLASS} group relative overflow-hidden rounded-2xl text-left cursor-pointer transition-[border-color,box-shadow] duration-300 ${
         selected
           ? "border-amber-500 ring-1 ring-amber-500/60 shadow-[0_0_30px_-8px_rgba(245,158,11,0.6)]"
-          : "hover:border-amber-600/60 hover:shadow-[0_0_28px_-10px_rgba(245,158,11,0.45)]"
+          : "hover:border-amber-600/60 hover:shadow-[0_0_15px_rgba(218,165,32,0.3)]"
       } ${spanClass(index)}`}
     >
       <div className="absolute right-2.5 top-2.5 z-20">
         <FavoriteButton
+          key={`${book.id}-${isFavorited}`}
           book={{
             id: book.id,
             title: book.title,
@@ -376,7 +389,7 @@ function BookCard({ book, index, selected, isFavorited, onSelect, onFavoriteTogg
             aria-hidden
             className="absolute inset-0 h-full w-full scale-125 object-cover opacity-25 blur-2xl"
           />
-          <div className="absolute inset-x-0 bottom-[68px] top-0 flex items-center justify-center p-4">
+          <div className="absolute inset-x-0 bottom-[68px] top-0 flex items-center justify-center p-4 sm:bottom-[92px]">
             {/* eslint-disable-next-line @next/next/no-img-element */}
             <img
               src={book.cover}
@@ -387,7 +400,7 @@ function BookCard({ book, index, selected, isFavorited, onSelect, onFavoriteTogg
           </div>
         </>
       ) : (
-        <div className="absolute inset-x-0 bottom-[68px] top-0 grid place-items-center">
+        <div className="absolute inset-x-0 bottom-[68px] top-0 grid place-items-center sm:bottom-[92px]">
           <div className="grid h-24 w-16 place-items-center rounded-md border border-amber-900/40 bg-black/30">
             <BookOpen className="h-6 w-6 text-amber-700" aria-hidden />
           </div>
@@ -401,6 +414,17 @@ function BookCard({ book, index, selected, isFavorited, onSelect, onFavoriteTogg
           {book.title}
         </p>
         <p className="mt-0.5 line-clamp-1 text-xs text-[#D4C5B9]">{authors}</p>
+
+        <ul aria-label="Vibe tags" className="mt-2 hidden items-center gap-1.5 sm:flex">
+          {vibeTags.map((tag) => (
+            <li
+              key={tag}
+              className="whitespace-nowrap rounded-full border border-amber-700/30 px-2 py-0.5 text-xs leading-none text-amber-200/60"
+            >
+              {tag}
+            </li>
+          ))}
+        </ul>
       </div>
     </motion.div>
   );
@@ -438,6 +462,54 @@ function DetailPanel({
   onFavoriteToggle: (bookId: string, isSaved: boolean) => void;
 }) {
   const authors = book?.authors.join(", ") || "Author unknown";
+  const [binding, setBinding] = useState(false);
+  const [bindError, setBindError] = useState<"login" | "failed" | null>(null);
+
+  useEffect(() => {
+    setBindError(null);
+  }, [book?.id]);
+
+  async function handleBind() {
+    if (!book || binding) return;
+    setBinding(true);
+    setBindError(null);
+
+    try {
+      const supabase = createClient();
+      const {
+        data: { user },
+      } = await supabase.auth.getUser();
+
+      if (!user) {
+        setBindError("login");
+        return;
+      }
+
+      if (isFavorited) {
+        const { error } = await supabase
+          .from("favorites")
+          .delete()
+          .eq("user_id", user.id)
+          .eq("book_id", book.id);
+        if (error) throw error;
+        onFavoriteToggle(book.id, false);
+      } else {
+        const { error } = await supabase.from("favorites").insert({
+          user_id: user.id,
+          book_id: book.id,
+          book_title: book.title,
+          book_author: authors,
+          book_cover: book.cover,
+        });
+        if (error) throw error;
+        onFavoriteToggle(book.id, true);
+      }
+    } catch {
+      setBindError("failed");
+    } finally {
+      setBinding(false);
+    }
+  }
 
   return (
     <AnimatePresence>
@@ -467,6 +539,7 @@ function DetailPanel({
               <span className="font-serif text-sm text-[#D4C5B9]">From the archive</span>
               <div className="flex items-center gap-2">
                 <FavoriteButton
+                  key={`${book.id}-${isFavorited}`}
                   book={{
                     id: book.id,
                     title: book.title,
@@ -570,19 +643,61 @@ function DetailPanel({
               </div>
             </motion.div>
 
-            {book.link && (
-              <div className="border-t border-amber-900/30 p-4">
+            <div className="space-y-2.5 border-t border-amber-900/30 p-4">
+              <button
+                type="button"
+                onClick={handleBind}
+                disabled={binding}
+                className={`flex w-full items-center justify-center gap-2 rounded-lg px-4 py-3 text-sm font-semibold transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-500 disabled:cursor-not-allowed disabled:opacity-70 ${
+                  isFavorited
+                    ? "border border-amber-500/60 bg-amber-500/10 text-amber-300 hover:bg-amber-500/20"
+                    : "bg-gradient-to-r from-amber-600 to-amber-700 text-white shadow-[0_0_20px_-6px_rgba(245,158,11,0.6)] hover:from-amber-500 hover:to-amber-600"
+                }`}
+              >
+                {binding ? (
+                  <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
+                ) : isFavorited ? (
+                  <BookmarkCheck className="h-4 w-4" aria-hidden />
+                ) : (
+                  <BookmarkPlus className="h-4 w-4" aria-hidden />
+                )}
+                {binding
+                  ? "Binding..."
+                  : isFavorited
+                    ? "Bound to your Grimoire"
+                    : "Bind to Grimoire"}
+              </button>
+
+              {bindError && (
+                <p role="alert" className="text-center text-xs text-red-300">
+                  {bindError === "login" ? (
+                    <>
+                      <Link
+                        href="/login"
+                        className="text-amber-400 underline underline-offset-2 hover:text-amber-300"
+                      >
+                        Log in
+                      </Link>{" "}
+                      to bind tomes to your Grimoire.
+                    </>
+                  ) : (
+                    "The binding failed. Please try again."
+                  )}
+                </p>
+              )}
+
+              {book.link && (
                 <a
                   href={book.link}
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="flex w-full items-center justify-center gap-2 rounded-lg bg-gradient-to-r from-amber-600 to-amber-700 px-4 py-2.5 text-sm font-semibold text-white shadow-[0_0_20px_-6px_rgba(245,158,11,0.6)] transition-colors hover:from-amber-500 hover:to-amber-600"
+                  className="flex w-full items-center justify-center gap-2 rounded-lg border border-amber-900/40 bg-transparent px-4 py-2.5 text-sm font-semibold text-[#FDFBF7] transition-colors hover:bg-amber-500/10"
                 >
                   Read the full tome
                   <ExternalLink className="h-4 w-4" aria-hidden />
                 </a>
-              </div>
-            )}
+              )}
+            </div>
           </motion.aside>
         </>
       )}

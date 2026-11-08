@@ -51,7 +51,7 @@ const USERNAME_HELP: Record<UsernameStatus, string> = {
 const EMPTY_FORM: FormState = { firstName: "", lastName: "", username: "" };
 
 /* -------------------------------------------------------------------------- */
-/*                                   Helpers                                  */
+/*                                  Helpers                                   */
 /* -------------------------------------------------------------------------- */
 
 function messageOf(err: unknown): string {
@@ -378,7 +378,7 @@ export default function ProfilePage() {
           <div className="min-h-0 flex-1 overflow-y-auto">
             {loading ? (
               <div aria-busy="true" aria-label="Loading profile">
-                <div className="skeleton h-32 w-full" />
+                <div className="skeleton h-40 w-full" />
                 <div className="skeleton -mt-10 ml-6 h-20 w-20 rounded-full border-4 border-[#1C130D]" />
                 <div className="space-y-5 p-6">
                   <div className="grid grid-cols-2 gap-4">
@@ -391,7 +391,7 @@ export default function ProfilePage() {
             ) : (
               <>
                 {/* Cover photo */}
-                <div className="relative h-32 w-full overflow-hidden bg-[radial-gradient(80%_120%_at_50%_0%,rgba(217,119,6,0.4),#2a1c12)]">
+                <div className="relative h-40 w-full overflow-hidden bg-[radial-gradient(80%_120%_at_50%_0%,rgba(217,119,6,0.4),#2a1c12)]">
                   {coverSrc && (
                     // eslint-disable-next-line @next/next/no-img-element
                     <img
@@ -400,7 +400,7 @@ export default function ProfilePage() {
                       className="absolute inset-0 h-full w-full object-cover"
                     />
                   )}
-                  <div className="absolute inset-0 flex items-center justify-center gap-3">
+                  <div className="absolute inset-x-0 top-0 bottom-10 flex items-center justify-center gap-3">
                     <button
                       type="button"
                       onClick={() => coverInputRef.current?.click()}
